@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>GitHub Repo Scanner — ZIP-first then REST</title>
+<title>GitHub Repo Scanner — ZIP-first then Trees API</title>
 <style>
   body{font-family:Inter,Segoe UI,Roboto,Arial,sans-serif;margin:18px;color:#111}
   .card{background:#fff;border:1px solid #e6e9ee;padding:12px;border-radius:8px}
@@ -21,11 +21,13 @@
   pre.content{background:#0b1220;color:#e6f2ff;padding:12px;border-radius:6px;border:1px solid #0f1724;white-space:pre-wrap;word-break:break-word}
   .status{font-size:13px;color:#666;margin-top:8px}
   .warn{color:#b44}
+  .small{font-size:12px;color:#666}
 </style>
 </head>
 <body>
+
 <div class="card">
-  <h2 style="margin:0 0 8px 0">GitHub Repo Scanner — ZIP-first then REST</h2>
+  <h2 style="margin:0 0 8px 0">GitHub Repo Scanner — ZIP-first then Trees API</h2>
   <div class="row" style="margin-bottom:8px">
     <label>Owner <input id="owner" type="text" value="jonnypaes" /></label>
     <label>Repo <input id="repo" type="text" value="console.js" /></label>
@@ -34,7 +36,7 @@
 
   <div class="row" style="margin-bottom:8px">
     <label>GitHub token (optional, empty by default)
-      <input id="token" type="password" placeholder="ghp_xxx (optional)" style="width:280px" />
+      <input id="token" type="password" placeholder="ghp_xxx (optional)" style="width:320px" />
     </label>
   </div>
 
@@ -45,7 +47,8 @@
     <button id="btnClear" disabled>Clear</button>
   </div>
 
-  <div id="status" class="status">Status: idle — will try ZIP via <code>api.github.com/zipball</code> first, then REST if ZIP fails.</div>
+  <div id="status" class="status">Status: idle — will try ZIP (api) first, then Trees API listing if ZIP fails.</div>
+  <div class="small" style="margin-top:6px">Behavior: ZIP → if any ZIP error → 1 call to <code>/git/trees?recursive=1</code> to get full listing → lazy blob fetch for file content.</div>
 </div>
 
 <div id="main">
@@ -60,17 +63,16 @@
   </div>
 </div>
 
+<!-- JSZip CDN -->
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+
 <script>
-/*
-  Behavior:
-   1) Try: GET https://api.github.com/repos/:owner/:repo/zipball/:branch
-      - If succeeds -> unzip in-browser -> build tree -> done.
-   2) If ZIP step fails (network, CORS, non-OK response, etc) -> then
-      call REST: recursively list `https://api.github.com/repos/:owner/:repo/contents/:path`
-      - If REST returns 403 -> stop and show message suggesting token (rate-limit)
-   3) Optional token input is respected if provided (not mandatory).
-   4) Export JSON/MD preserved.
+/* Strict sequence:
+   1) Try zip via api.github.com zipball -> if success: unzip + build tree
+   2) On any ZIP failure -> call GET /repos/:owner/:repo/git/trees/:branch?recursive=1
+      - Build tree from returned entries (single call)
+      - For file content preview, lazy fetch GET /repos/:owner/:repo/git/blobs/:sha
+   3) If any GitHub API call returns 403 -> show clear message to set token
 */
 
 const $ = id => document.getElementById(id);
@@ -78,41 +80,40 @@ const btnLoad = $('btnLoad'), btnExportJSON = $('btnExportJSON'), btnExportMD = 
 const ownerEl = $('owner'), repoEl = $('repo'), branchEl = $('branch'), tokenEl = $('token');
 const statusEl = $('status'), repoPathEl = $('repoPath'), treeEl = $('tree'), fileInfoEl = $('fileInfo'), fileContentEl = $('fileContent');
 
-let repoTree = null;
-let loadMode = null;
+let repoTree = null; // in-memory tree
+let loadMode = null; // 'zip' or 'trees'
 
+/* Helpers */
 function setStatus(msg, warn=false){
   statusEl.textContent = (warn ? '⚠️ ' : 'Status: ') + msg;
   if(warn) statusEl.classList.add('warn'); else statusEl.classList.remove('warn');
 }
-
-function downloadBlob(name, blob){
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
-  setTimeout(()=>URL.revokeObjectURL(url), 2000);
-}
-
 function buildAuthHeaders(){
   const headers = { 'Accept': 'application/vnd.github.v3+json' };
   const token = (tokenEl.value || '').trim();
   if(token) headers['Authorization'] = `token ${token}`;
   return headers;
 }
+function downloadBlob(name, blob){ const url = URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=name; document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(url),2000); }
+function escapeHtml(s){ if(s==null) return ''; return s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+async function arrayBufferToBase64(ab){ const bytes = new Uint8Array(ab); let binary=''; const chunk=0x8000; for(let i=0;i<bytes.length;i+=chunk) binary+=String.fromCharCode.apply(null, bytes.subarray(i, i+chunk)); return btoa(binary); }
 
-/* ---------------- ZIP via api.github.com (CORS-safe) ---------------- */
+/* 1) Try ZIP via API zipball (may still redirect internally) */
 async function tryZipApi(owner, repo, branch){
-  setStatus('Attempting ZIP via api.github.com (cors-safe zipball)...');
+  setStatus('Attempting ZIP via api.github.com zipball (CORS-safe attempt)...');
   const url = `https://api.github.com/repos/${owner}/${repo}/zipball/${branch}`;
   const res = await fetch(url, { headers: buildAuthHeaders() });
-  if(!res.ok) throw new Error(`ZIP API download failed: ${res.status} ${res.statusText}`);
+  if(!res.ok) throw new Error(`ZIP API failed: ${res.status} ${res.statusText}`);
   const blob = await res.blob();
   setStatus(`ZIP downloaded (${Math.round(blob.size/1024)} KB). Unpacking...`);
   const zip = await JSZip.loadAsync(blob);
-  return buildTreeFromZip(zip, repo);
+  const tree = buildTreeFromZip(zip, repo);
+  loadMode = 'zip';
+  setStatus('Loaded via ZIP.');
+  return tree;
 }
 
-/* ---------------- build tree from JSZip ---------------- */
+/* Build tree from JSZip entries */
 function buildTreeFromZip(zip, repoName){
   const keys = Object.keys(zip.files);
   let prefix = '';
@@ -120,17 +121,13 @@ function buildTreeFromZip(zip, repoName){
     const m = keys[0].match(/^([^\/]+)\//);
     if(m) prefix = m[1] + '/';
   }
-
-  const root = { type:'folder', name:repoName, path:'', children:[] };
+  const root = { type:'folder', name: repoName, path:'', children: [] };
 
   function ensureFolder(parent, parts){
     if(parts.length === 0) return parent;
     const head = parts.shift();
     let child = parent.children.find(c => c.type === 'folder' && c.name === head);
-    if(!child){
-      child = { type:'folder', name: head, path: parent.path ? parent.path + '/' + head : head, children: [] };
-      parent.children.push(child);
-    }
+    if(!child) { child = { type:'folder', name: head, path: parent.path ? parent.path + '/' + head : head, children: [] }; parent.children.push(child); }
     return ensureFolder(child, parts);
   }
 
@@ -142,7 +139,7 @@ function buildTreeFromZip(zip, repoName){
     files.push({ path: cleaned, fileObj });
   });
 
-  files.sort((a,b) => a.path.localeCompare(b.path));
+  files.sort((a,b)=>a.path.localeCompare(b.path));
 
   for(const f of files){
     const parts = f.path.split('/');
@@ -153,68 +150,140 @@ function buildTreeFromZip(zip, repoName){
       name,
       path: f.path,
       jszipFile: f.fileObj,
+      sha: null, // unknown for zip entries
+      size: f.fileObj._data ? f.fileObj._data.uncompressedSize : null,
       contentText: null,
       contentBase64: null,
-      isBinary: false,
-      size: f.fileObj._data ? f.fileObj._data.uncompressedSize : null
+      isBinary: false
+    });
+  }
+  return root;
+}
+
+/* 2) Trees API fallback (single call) */
+async function tryTreesApi(owner, repo, branch){
+  setStatus('ZIP failed — falling back to Git Trees API (single-call listing)...');
+  // Note: branch can be a branch name; trees endpoint accepts branch name or SHA for :tree_sha
+  const url = `https://api.github.com/repos/${owner}/${repo}/git/trees/${encodeURIComponent(branch)}?recursive=1`;
+  const res = await fetch(url, { headers: buildAuthHeaders() });
+  if(res.status === 404){
+    // Sometimes branch name is not directly usable here; try to resolve branch -> commit sha
+    setStatus('Trees API returned 404 for branch. Attempting to resolve branch to SHA...');
+    const refUrl = `https://api.github.com/repos/${owner}/${repo}/git/refs/heads/${encodeURIComponent(branch)}`;
+    const refRes = await fetch(refUrl, { headers: buildAuthHeaders() });
+    if(!refRes.ok){
+      if(refRes.status === 403) throw new Error('Trees API 403 — rate-limited or forbidden. Provide a token.');
+      throw new Error(`Failed to resolve branch: ${refRes.status} ${refRes.statusText}`);
+    }
+    const refJson = await refRes.json();
+    const sha = refJson.object && refJson.object.sha;
+    if(!sha) throw new Error('Could not resolve branch SHA');
+    // retry trees with resolved SHA
+    const url2 = `https://api.github.com/repos/${owner}/${repo}/git/trees/${sha}?recursive=1`;
+    const res2 = await fetch(url2, { headers: buildAuthHeaders() });
+    if(res2.status === 403) throw new Error('Trees API 403 — rate-limited or forbidden. Provide a token.');
+    if(!res2.ok) throw new Error(`Trees API failed: ${res2.status} ${res2.statusText}`);
+    const json2 = await res2.json();
+    return buildTreeFromTreesJson(json2, repo);
+  }
+
+  if(res.status === 403) throw new Error('Trees API 403 — rate-limited or forbidden. Provide a token.');
+  if(!res.ok) throw new Error(`Trees API failed: ${res.status} ${res.statusText}`);
+  const json = await res.json();
+  return buildTreeFromTreesJson(json, repo);
+}
+
+/* Build tree from trees API JSON */
+function buildTreeFromTreesJson(json, repoName){
+  // json.tree is array of { path, mode, type: "blob"|"tree", sha, size? }
+  const root = { type:'folder', name: repoName, path:'', children: [] };
+
+  function ensureFolder(parent, parts){
+    if(parts.length === 0) return parent;
+    const head = parts.shift();
+    let child = parent.children.find(c => c.type === 'folder' && c.name === head);
+    if(!child){ child = { type:'folder', name: head, path: parent.path ? parent.path + '/' + head : head, children: [] }; parent.children.push(child); }
+    return ensureFolder(child, parts);
+  }
+
+  const entries = json.tree || [];
+  // sort entries by path so insertion produces stable order
+  entries.sort((a,b)=>a.path.localeCompare(b.path));
+
+  for(const e of entries){
+    if(e.type === 'tree') continue; // skip folder entries (we build folders by file paths)
+    // blob => file
+    const parts = e.path.split('/');
+    const name = parts.pop();
+    const folder = ensureFolder(root, parts);
+    folder.children.push({
+      type: 'file',
+      name,
+      path: e.path,
+      sha: e.sha,
+      size: e.size || null,
+      jszipFile: null,
+      contentText: null,
+      contentBase64: null,
+      isBinary: false
     });
   }
 
-  setStatus('ZIP unpacked and tree built (zip mode).');
-  loadMode = 'zip';
+  loadMode = 'trees';
+  setStatus('Built tree from Trees API (single call).');
   return root;
 }
 
-/* ---------------- REST per-folder recursion ---------------- */
-async function fetchJsonWithAuth(url){
-  const res = await fetch(url, { headers: buildAuthHeaders() });
-  return res;
-}
+/* Preview file: if zip-backed -> read from jszipFile; else if sha -> fetch blob */
+async function previewFile(node){
+  fileInfoEl.textContent = node.path + (node.size ? ` — ${node.size} bytes` : '');
+  fileContentEl.innerHTML = '';
 
-async function tryRestContents(owner, repo){
-  setStatus('Falling back to REST contents API (recursive).');
-  const root = { type:'folder', name: repo, path:'', children: [] };
-
-  async function scanFolder(parent, path){
-    const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path || ''}`;
-    setStatus(`Listing: ${path || '/'}`);
-    const res = await fetchJsonWithAuth(url);
-    if(res.status === 403){
-      // Rate-limited or forbidden — bubble up with hint
-      throw new Error('REST API 403 — rate-limited or forbidden. Provide a token to increase limits.');
-    }
-    if(!res.ok) throw new Error(`GitHub API ${res.status} — ${url}`);
-    const entries = await res.json();
-    if(!Array.isArray(entries)) return;
-    // sort dirs first
-    entries.sort((a,b) => (a.type === b.type) ? a.name.localeCompare(b.name) : (a.type === 'dir' ? -1 : 1));
-    for(const item of entries){
-      if(item.type === 'dir'){
-        const node = { type:'folder', name: item.name, path: item.path, children: [] };
-        parent.children.push(node);
-        await scanFolder(node, item.path);
-      } else if(item.type === 'file'){
-        parent.children.push({
-          type:'file',
-          name: item.name,
-          path: item.path,
-          url: item.url,
-          contentText: null,
-          contentBase64: null,
-          isBinary: false,
-          size: item.size || null
-        });
-      }
-    }
+  if(node.jszipFile){
+    setStatus(`Reading ${node.path} from ZIP...`);
+    try {
+      const text = await node.jszipFile.async('string');
+      if(text.indexOf('\0') !== -1){ node.isBinary = true; fileContentEl.innerHTML = '<div class="warn">Binary file — preview not shown</div>'; }
+      else { node.contentText = text; fileContentEl.innerHTML = `<pre class="content">${escapeHtml(text)}</pre>`; }
+    } catch(e){
+      node.isBinary = true;
+      fileContentEl.innerHTML = '<div class="warn">Cannot preview (binary or read error)</div>';
+    } finally { setStatus('Ready.'); }
+    return;
   }
 
-  await scanFolder(root, '');
-  setStatus('REST tree built (rest mode).');
-  loadMode = 'rest';
-  return root;
+  if(node.sha){
+    setStatus(`Fetching blob for ${node.path} (sha ${node.sha})...`);
+    const url = `https://api.github.com/repos/${ownerEl.value}/${repoEl.value}/git/blobs/${node.sha}`;
+    const res = await fetch(url, { headers: buildAuthHeaders() });
+    if(res.status === 403) { setStatus('Blob fetch 403 — token required to increase limits.', true); fileContentEl.innerHTML = '<div class="warn">403 — provide token</div>'; return; }
+    if(!res.ok) { fileContentEl.innerHTML = `<div class="warn">Blob fetch failed: ${res.status}</div>`; setStatus('Ready.'); return; }
+    const data = await res.json();
+    const b64 = (data.content || '').replace(/\n/g,'');
+    node.contentBase64 = b64;
+    // decode to text if possible
+    try {
+      const raw = atob(b64);
+      // decode utf8
+      let decoded;
+      try {
+        const bytes = [];
+        for(let i=0;i<raw.length;i++) bytes.push('%' + ('00' + raw.charCodeAt(i).toString(16)).slice(-2));
+        decoded = decodeURIComponent(bytes.join(''));
+      } catch(_) { decoded = raw; }
+      if(decoded.indexOf('\0') !== -1){ node.isBinary = true; fileContentEl.innerHTML = '<div class="warn">Binary file — preview skipped</div>'; }
+      else { node.contentText = decoded; fileContentEl.innerHTML = `<pre class="content">${escapeHtml(decoded)}</pre>`; }
+    } catch(e){
+      node.isBinary = true;
+      fileContentEl.innerHTML = '<div class="warn">Failed to decode blob</div>';
+    } finally { setStatus('Ready.'); }
+    return;
+  }
+
+  fileContentEl.innerHTML = '<div class="small">No preview available.</div>';
 }
 
-/* ---------------- Render tree UI ---------------- */
+/* Render tree UI (folders expandable) */
 function renderTree(root){
   treeEl.innerHTML = '';
   function makeFolder(node){
@@ -234,173 +303,92 @@ function renderTree(root){
     }
     return wrap;
   }
-  function makeFile(fileNode){
+  function makeFile(f){
     const el = document.createElement('div');
     el.className = 'file';
-    el.textContent = '📄 ' + fileNode.name;
-    el.title = fileNode.path;
-    el.onclick = () => previewFile(fileNode);
+    el.textContent = '📄 ' + f.name;
+    el.title = f.path;
+    el.onclick = () => previewFile(f);
     return el;
   }
   treeEl.appendChild(makeFolder(root));
 }
 
-/* ---------------- Preview file (lazy load) ---------------- */
-async function previewFile(node){
-  fileInfoEl.textContent = node.path + (node.size ? ` — ${node.size} bytes` : '');
-  fileContentEl.innerHTML = '';
-
-  // ZIP-backed file: node.jszipFile
-  if(node.jszipFile){
-    setStatus(`Reading ${node.path} from ZIP...`);
-    try {
-      const text = await node.jszipFile.async('string');
-      if(text.indexOf('\0') !== -1){
-        node.isBinary = true;
-        fileContentEl.innerHTML = '<div class="warn">Binary file — preview skipped</div>';
-      } else {
-        node.contentText = text;
-        fileContentEl.innerHTML = `<pre class="content">${escapeHtml(text)}</pre>`;
-      }
-    } catch(e){
-      node.isBinary = true;
-      fileContentEl.innerHTML = '<div class="warn">Cannot preview (binary or read error)</div>';
-    } finally {
-      setStatus('Ready.');
-    }
-    return;
-  }
-
-  // REST-backed file: node.url
-  if(node.url){
-    setStatus(`Fetching ${node.path} via REST...`);
-    try {
-      const res = await fetchJsonWithAuth(node.url);
-      if(res.status === 403){
-        throw new Error('REST API 403 — rate-limited or forbidden. Provide a token to increase limits.');
-      }
-      if(!res.ok) throw new Error(`GitHub API ${res.status} — ${node.url}`);
-      const data = await res.json();
-      const b64 = (data.content || '').replace(/\n/g,'');
-      // decode base64 safely to UTF-8 if possible
-      let raw = atob(b64);
-      let decoded = null;
-      try {
-        const bytes = [];
-        for(let i=0;i<raw.length;i++) bytes.push('%' + ('00' + raw.charCodeAt(i).toString(16)).slice(-2));
-        decoded = decodeURIComponent(bytes.join(''));
-      } catch(_) {
-        decoded = raw;
-      }
-      if(decoded.indexOf('\0') !== -1){
-        node.isBinary = true;
-        fileContentEl.innerHTML = '<div class="warn">Binary file — preview skipped</div>';
-        node.contentBase64 = b64;
-      } else {
-        node.contentText = decoded;
-        fileContentEl.innerHTML = `<pre class="content">${escapeHtml(decoded)}</pre>`;
-        node.contentBase64 = b64;
-      }
-    } catch(e){
-      fileContentEl.innerHTML = `<div class="warn">${escapeHtml(e.message)}</div>`;
-    } finally {
-      setStatus('Ready.');
-    }
-    return;
-  }
-
-  fileContentEl.innerHTML = '<div class="small">No preview available</div>';
-}
-
-/* ---------------- Export helpers ---------------- */
-function serializeNode(node){
-  if(node.type === 'folder') return { type:'folder', name: node.name, path: node.path || '', children: node.children.map(serializeNode) };
-  return {
-    type:'file',
-    name: node.name,
-    path: node.path,
-    size: node.size || null,
-    isBinary: !!node.isBinary,
-    contentText: node.contentText || null,
-    contentBase64: node.contentBase64 || null,
-    url: node.url || null
-  };
-}
-
+/* Helper: collect all files (may fetch blobs) — used for exports */
 function walkFiles(root){
   const out = [];
-  (function w(n){ if(n.type==='file') out.push(n); else n.children.forEach(w); })(root);
+  (function w(n){ if(n.type === 'file') out.push(n); else n.children.forEach(w); })(root);
   return out;
-}
-
-async function arrayBufferToBase64(ab){
-  const bytes = new Uint8Array(ab);
-  let binary = '';
-  const chunk = 0x8000;
-  for (let i=0;i<bytes.length;i+=chunk){
-    binary += String.fromCharCode.apply(null, bytes.subarray(i, i+chunk));
-  }
-  return btoa(binary);
 }
 
 async function collectAllFiles(root){
   const files = walkFiles(root);
   const total = files.length;
   let processed = 0;
-  setStatus(`Collecting ${total} files (this will fetch file contents)`);
-
+  setStatus(`Collecting ${total} files (will fetch blobs if needed)`);
   for(const f of files){
-    if(f.contentBase64 || f.contentText) { processed++; setStatus(`Collected ${processed}/${total}`); continue; }
-
+    if(f.contentBase64 || f.contentText){ processed++; setStatus(`Collected ${processed}/${total}`); continue; }
     if(f.jszipFile){
       try {
         const ab = await f.jszipFile.async('arraybuffer');
         f.contentBase64 = await arrayBufferToBase64(ab);
-        // try text decode
         try {
           const text = await f.jszipFile.async('string');
           if(text.indexOf('\0') === -1) f.contentText = text;
         } catch(_) {}
-      } catch(_) { /* ignore */ }
-    } else if(f.url){
-      try {
-        const res = await fetchJsonWithAuth(f.url);
-        if(res.status === 403) throw new Error('REST API 403 — rate-limited or forbidden. Provide token.');
-        if(!res.ok) throw new Error('File fetch failed: ' + res.status);
-        const data = await res.json();
-        const b64 = (data.content || '').replace(/\n/g,'');
-        f.contentBase64 = b64;
-        try {
-          const raw = atob(b64);
-          const bytes = [];
-          for(let i=0;i<raw.length;i++) bytes.push('%' + ('00' + raw.charCodeAt(i).toString(16)).slice(-2));
-          const text = decodeURIComponent(bytes.join(''));
-          if(text.indexOf('\0') === -1) f.contentText = text;
-        } catch(_) {}
-      } catch(e){
-        f.contentBase64 = null;
-      }
+      } catch(_) {}
+      processed++; setStatus(`Collected ${processed}/${total}`); continue;
     }
-    processed++;
-    setStatus(`Collected ${processed}/${total}`);
+    if(f.sha){
+      const url = `https://api.github.com/repos/${ownerEl.value}/${repoEl.value}/git/blobs/${f.sha}`;
+      const res = await fetch(url, { headers: buildAuthHeaders() });
+      if(res.status === 403) throw new Error('Blob fetch 403 — rate-limited. Provide token.');
+      if(!res.ok) { processed++; setStatus(`Collected ${processed}/${total}`); continue; }
+      const data = await res.json();
+      const b64 = (data.content || '').replace(/\n/g,'');
+      f.contentBase64 = b64;
+      try {
+        const raw = atob(b64);
+        const bytes = [];
+        for(let i=0;i<raw.length;i++) bytes.push('%' + ('00' + raw.charCodeAt(i).toString(16)).slice(-2));
+        const text = decodeURIComponent(bytes.join(''));
+        if(text.indexOf('\0') === -1) f.contentText = text;
+      } catch(_) {}
+      processed++; setStatus(`Collected ${processed}/${total}`); continue;
+    }
+    processed++; setStatus(`Collected ${processed}/${total}`);
   }
   setStatus(`Collection complete (${total} files)`);
   return files;
 }
 
+/* Exports */
 async function exportJSON(){
   if(!repoTree) return alert('Load repo first');
-  const filesCount = walkFiles(repoTree).length;
-  if(filesCount > 1000 && !confirm(`Repo has ~${filesCount} files. Export may be slow and memory-heavy. Continue?`)) return;
+  const fileCount = walkFiles(repoTree).length;
+  if(fileCount > 1000 && !confirm(`Repo has ~${fileCount} files. Export will fetch blobs and may be slow. Continue?`)) return;
   btnExportJSON.disabled = true; btnExportMD.disabled = true; btnLoad.disabled = true;
   try {
     await collectAllFiles(repoTree);
-    const payload = { generatedAt: new Date().toISOString(), repo: `${ownerEl.value}/${repoEl.value}`, loadMode, root: serializeNode(repoTree) };
+    function serialize(node){
+      if(node.type === 'folder') return { type:'folder', name: node.name, path: node.path || '', children: node.children.map(serialize) };
+      return {
+        type:'file',
+        name: node.name,
+        path: node.path,
+        size: node.size || null,
+        isBinary: !!node.isBinary,
+        contentText: node.contentText || null,
+        contentBase64: node.contentBase64 || null,
+        sha: node.sha || null
+      };
+    }
+    const payload = { generatedAt: new Date().toISOString(), repo: `${ownerEl.value}/${repoEl.value}`, loadMode, root: serialize(repoTree) };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     downloadBlob(`${ownerEl.value}-${repoEl.value}-tree.json`, blob);
     setStatus('JSON exported.');
   } catch(e){
-    setStatus(`Export failed: ${e.message}`, true);
+    setStatus(`Export JSON failed: ${e.message}`, true);
   } finally {
     btnExportJSON.disabled = false; btnExportMD.disabled = false; btnLoad.disabled = false;
   }
@@ -408,8 +396,8 @@ async function exportJSON(){
 
 async function exportMarkdown(){
   if(!repoTree) return alert('Load repo first');
-  const filesCount = walkFiles(repoTree).length;
-  if(filesCount > 1000 && !confirm(`Repo has ~${filesCount} files. Export may be slow and memory-heavy. Continue?`)) return;
+  const fileCount = walkFiles(repoTree).length;
+  if(fileCount > 1000 && !confirm(`Repo has ~${fileCount} files. Export will fetch blobs and may be slow. Continue?`)) return;
   btnExportJSON.disabled = true; btnExportMD.disabled = true; btnLoad.disabled = true;
   try {
     await collectAllFiles(repoTree);
@@ -422,100 +410,79 @@ async function exportMarkdown(){
     }
     md += `\n---\n\n`;
     // tree outline
-    function renderTree(node, depth=0){
+    (function render(node, depth=0){
       const indent = '  '.repeat(depth);
-      if(node.type === 'folder'){
-        md += `${indent}- **${node.name}**\n`;
-        for(const c of node.children) renderTree(c, depth+1);
-      } else {
-        md += `${indent}  - ${node.name}\n`;
-      }
-    }
-    renderTree(repoTree, 0);
+      if(node.type === 'folder'){ md += `${indent}- **${node.name}**\n`; node.children.forEach(c=>render(c, depth+1)); }
+      else md += `${indent}- ${node.name}\n`;
+    })(repoTree, 0);
     md += `\n---\n\n`;
     for(const f of files){
       md += `### ${f.path}\n<a id="${f.__anchor}"></a>\n\n`;
-      if(f.contentText){
-        md += `\`\`\`\n${f.contentText.replace(/```/g,'``\\`')}\n\`\`\`\n\n`;
-      } else if(f.contentBase64){
-        md += `_binary file — base64 below_\n\n\`\`\`base64\n${f.contentBase64}\n\`\`\`\n\n`;
-      } else {
-        md += `_no content available_\n\n`;
-      }
+      if(f.contentText) md += `\`\`\`\n${f.contentText.replace(/```/g,'``\\`')}\n\`\`\`\n\n`;
+      else if(f.contentBase64) md += `_binary file — base64 below_\n\n\`\`\`base64\n${f.contentBase64}\n\`\`\`\n\n`;
+      else md += `_no content available_\n\n`;
     }
     const blob = new Blob([md], { type: 'text/markdown' });
     downloadBlob(`${ownerEl.value}-${repoEl.value}-tree.md`, blob);
     setStatus('Markdown exported.');
   } catch(e){
-    setStatus(`Export failed: ${e.message}`, true);
+    setStatus(`Export MD failed: ${e.message}`, true);
   } finally {
     btnExportJSON.disabled = false; btnExportMD.disabled = false; btnLoad.disabled = false;
   }
 }
 
-/* ---------------- Main flow: ZIP first, then REST on any ZIP error ---------------- */
+/* Main flow: ZIP first -> Trees API (single call) fallback */
 async function loadRepo(){
-  repoTree = null;
-  treeEl.innerHTML = '';
-  fileInfoEl.textContent = 'No file selected';
-  fileContentEl.innerHTML = '';
+  repoTree = null; treeEl.innerHTML=''; fileInfoEl.textContent='No file selected'; fileContentEl.innerHTML='';
   btnExportJSON.disabled = true; btnExportMD.disabled = true; btnClear.disabled = true;
-  setStatus('Starting: will try ZIP (api) first...');
-  const owner = (ownerEl.value || '').trim();
-  const repo = (repoEl.value || '').trim();
-  const branch = (branchEl.value || 'main').trim();
+  setStatus('Starting — ZIP-first strategy...');
+  const owner = (ownerEl.value || '').trim(); const repo = (repoEl.value || '').trim(); const branch = (branchEl.value || 'main').trim();
 
   try {
-    // 1) Try zip via api.github.com
+    // 1) Try ZIP via API
     try {
       const tree = await tryZipApi(owner, repo, branch);
       repoTree = tree;
       renderTree(repoTree);
       repoPathEl.textContent = `${owner}/${repo}  •  mode: ZIP`;
       btnExportJSON.disabled = false; btnExportMD.disabled = false; btnClear.disabled = false;
-      setStatus('Loaded via ZIP (api).');
       return;
     } catch(zipErr){
-      console.warn('ZIP attempt failed, will try REST fallback:', zipErr);
-      // continue to REST fallback
+      console.warn('ZIP attempt failed — will try Trees API listing:', zipErr);
+      // continue to trees fallback
     }
 
-    // 2) REST fallback
+    // 2) Try Trees API (single-call listing)
     try {
-      const tree = await tryRestContents(owner, repo);
+      const tree = await tryTreesApi(owner, repo, branch);
       repoTree = tree;
       renderTree(repoTree);
-      repoPathEl.textContent = `${owner}/${repo}  •  mode: REST`;
+      repoPathEl.textContent = `${owner}/${repo}  •  mode: TREES`;
       btnExportJSON.disabled = false; btnExportMD.disabled = false; btnClear.disabled = false;
-      setStatus('Loaded via REST (contents API).');
       return;
-    } catch(restErr){
-      // If REST failed with 403, give clear guidance
-      if(('' + restErr).includes('403') || (restErr.message && restErr.message.includes('403'))){
-        setStatus('Load failed: REST API 403 — rate-limited or forbidden. Provide a GitHub token in the token field and try again.', true);
+    } catch(treesErr){
+      // If treesErr mentions 403 -> advise token
+      if(('' + treesErr).includes('403') || (treesErr.message && treesErr.message.includes('403'))){
+        setStatus('Load failed: Trees API 403 — rate-limited or forbidden. Provide a GitHub token in the token field and try again.', true);
       } else {
-        setStatus('Load failed: ' + restErr.message, true);
+        setStatus('Load failed: ' + treesErr.message, true);
       }
-      throw restErr;
+      throw treesErr;
     }
 
-  } catch(e){
-    console.error('Final load error:', e);
-    // bubble up status already set
+  } catch(finalErr){
+    console.error('Final load error:', finalErr);
+    // status already set
   }
 }
 
-/* ---------------- UI wiring ---------------- */
-btnLoad.onclick = async () => {
-  btnLoad.disabled = true;
-  await loadRepo();
-  btnLoad.disabled = false;
-};
+/* UI wiring */
+btnLoad.onclick = async () => { btnLoad.disabled = true; await loadRepo(); btnLoad.disabled = false; };
 btnExportJSON.onclick = exportJSON;
 btnExportMD.onclick = exportMarkdown;
 btnClear.onclick = () => { repoTree = null; treeEl.innerHTML=''; repoPathEl.textContent='No repo loaded'; fileInfoEl.textContent='No file selected'; fileContentEl.innerHTML=''; btnExportJSON.disabled = true; btnExportMD.disabled = true; btnClear.disabled = true; setStatus('Idle'); };
 
-function escapeHtml(s){ if(s==null) return ''; return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 </script>
 </body>
 </html>
