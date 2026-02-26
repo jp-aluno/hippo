@@ -1,0 +1,290 @@
+// index.html
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>GitHub Repo Tree Scanner (ZIP + REST + fallback)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<style>
+  body{font-family:Arial; margin:20px;}
+  button{padding:6px 12px; margin:6px;}
+  input{padding:4px;}
+  #tree{border:1px solid #ccc;padding:10px;max-height:55vh;overflow:auto;margin-top:10px;}
+  .folder{font-weight:bold;margin-top:4px;}
+  .file{margin-left:16px;color:blue;cursor:pointer;}
+  pre{background:#eee;padding:10px;white-space:pre-wrap;}
+</style>
+
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+
+</head>
+<body>
+
+<h2>GitHub Repo Scanner (ZIP → fallback → REST)</h2>
+
+<label>Owner <input id="owner" value="jonnypaes"></label>
+<label>Repo <input id="repo" value="console.js"></label>
+<label>Branch <input id="branch" value="main"></label>
+
+<br><br>
+
+<button id="btnLoad">Load Repository</button>
+<button id="btnExportJSON">Export JSON</button>
+<button id="btnExportMD">Export Markdown</button>
+
+<div id="status" style="margin-top:10px;color:#444;">Idle</div>
+
+<h3>Repository Tree</h3>
+<div id="tree"></div>
+
+<h3>Preview</h3>
+<div id="info">No file selected</div>
+<pre id="preview" style="display:none"></pre>
+
+<script>
+const $ = id => document.getElementById(id);
+let globalTree = null;
+
+/* ----------------------- UTIL ----------------------- */
+function downloadFile(name, content){
+  const blob = new Blob([content], {type:"text/plain"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+/* ----------------------- ZIP MODE ----------------------- */
+async function loadRepoZip(owner, repo, branch){
+  $("status").textContent = "Attempting ZIP download…";
+
+  const zipUrl = `https://github.com/${owner}/${repo}/archive/refs/heads/${branch}.zip`;
+  const response = await fetch(zipUrl);
+
+  if(!response.ok)
+    throw new Error("ZIP download failed: " + response.status);
+
+  const blob = await response.blob();
+  $("status").textContent = "Unpacking ZIP…";
+
+  const zip = await JSZip.loadAsync(blob);
+
+  let prefix = "";
+  for(const name of Object.keys(zip.files)){
+    const m = name.match(/^([^\/]+)\//);
+    if(m) { prefix = m[1] + "/"; break; }
+  }
+
+  const root = { type:"folder", name:repo, path:"", children:[] };
+
+  function ensureFolder(parent, parts){
+    if(parts.length===0) return parent;
+    const next = parts.shift();
+    let f = parent.children.find(x=>x.type==="folder" && x.name===next);
+    if(!f){
+      f = {type:"folder",name:next,path:parent.path? parent.path+"/"+next : next,children:[]};
+      parent.children.push(f);
+    }
+    return ensureFolder(f, parts);
+  }
+
+  zip.forEach((filepath, fileObj)=>{
+    if(fileObj.dir) return;
+
+    const clean = filepath.startsWith(prefix) ? filepath.slice(prefix.length) : filepath;
+    if(!clean) return;
+
+    const parts = clean.split("/");
+    const filename = parts.pop();
+
+    const folder = ensureFolder(root, [...parts]);
+    folder.children.push({
+      type:"file",
+      name:filename,
+      path:clean,
+      jszipFile:fileObj,
+      content:null,
+      isBinary:false
+    });
+  });
+
+  $("status").textContent = "ZIP OK.";
+  return root;
+}
+
+/* ----------------------- REST MODE ----------------------- */
+async function fetchJSON(url){
+  const r = await fetch(url);
+  if(!r.ok) throw new Error("GitHub API " + r.status + " — " + url);
+  return r.json();
+}
+
+async function loadRepoREST(owner, repo, branch){
+  $("status").textContent = "Fallback → REST mode scanning…";
+
+  const root = { type:"folder", name:repo, path:"", children:[] };
+
+  async function scanFolder(parent, path){
+    const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
+    $("status").textContent = `REST listing: ${path || "/"}`;
+
+    let entries = await fetchJSON(url);
+
+    for(const item of entries){
+      if(item.type === "dir"){
+        const f = {
+          type:"folder",
+          name:item.name,
+          path:item.path,
+          children:[]
+        };
+        parent.children.push(f);
+        await scanFolder(f, item.path);
+      } else if(item.type === "file"){
+        parent.children.push({
+          type:"file",
+          name:item.name,
+          path:item.path,
+          url:item.url,
+          content:null,
+          isBinary:false
+        });
+      }
+    }
+  }
+
+  await scanFolder(root, "");
+  $("status").textContent = "REST OK.";
+  return root;
+}
+
+/* ----------------------- AUTO MODE ----------------------- */
+async function loadRepoAuto(owner, repo, branch){
+  try{
+    return await loadRepoZip(owner, repo, branch);
+  } catch(e){
+    if(e.name === "TypeError" || (""+e).includes("NetworkError")){
+      $("status").textContent = "ZIP failed → switching to REST…";
+      return await loadRepoREST(owner, repo, branch);
+    }
+    throw e;
+  }
+}
+
+/* ----------------------- TREE RENDER ----------------------- */
+function renderTree(root){
+  const tree = $("tree");
+  tree.innerHTML = "";
+
+  function walk(node, parentEl){
+    if(node.type === "folder"){
+      const d = document.createElement("div");
+      d.textContent = "📁 " + node.name;
+      d.className = "folder";
+      parentEl.appendChild(d);
+
+      const sub = document.createElement("div");
+      sub.style.marginLeft = "16px";
+      parentEl.appendChild(sub);
+
+      for(const c of node.children) walk(c, sub);
+    } else {
+      const f = document.createElement("div");
+      f.textContent = "📄 " + node.name;
+      f.className = "file";
+
+      f.onclick = async ()=>{
+        $("info").textContent = node.path;
+
+        if(node.jszipFile && node.content === null){
+          $("status").textContent = "Reading ZIP file…";
+          try{
+            const text = await node.jszipFile.async("string");
+            if(text.indexOf("\0")!==-1){
+              node.isBinary=true;
+              $("preview").style.display="none";
+            } else {
+              node.content=text;
+              $("preview").textContent=text;
+              $("preview").style.display="block";
+            }
+          }catch(e){
+            node.isBinary=true;
+            $("preview").style.display="none";
+          }
+          $("status").textContent = "Ready.";
+        } 
+        else if(node.url && node.content===null){
+          $("status").textContent = "Fetching REST file…";
+          const data = await fetchJSON(node.url);
+          const txt = atob(data.content.replace(/\n/g,""));
+          node.content = txt;
+          $("preview").textContent = txt;
+          $("preview").style.display="block";
+          $("status").textContent = "Ready.";
+        }
+        else{
+          if(node.content){
+            $("preview").textContent = node.content;
+            $("preview").style.display="block";
+          } else $("preview").style.display="none";
+        }
+      };
+
+      parentEl.appendChild(f);
+    }
+  }
+
+  walk(root, tree);
+}
+
+/* ----------------------- EXPORT JSON ----------------------- */
+function exportJSON(){
+  if(!globalTree) return alert("Load a repo first.");
+  downloadFile("repo.json", JSON.stringify(globalTree, null, 2));
+}
+
+/* ----------------------- EXPORT MARKDOWN ----------------------- */
+function treeToMD(node, depth=0){
+  const indent = "  ".repeat(depth);
+  let s="";
+  if(node.type==="folder"){
+    s += `${indent}- **${node.name}/**\n`;
+    for(const c of node.children) s += treeToMD(c, depth+1);
+  } else {
+    s += `${indent}- ${node.name}\n`;
+  }
+  return s;
+}
+
+function exportMD(){
+  if(!globalTree) return alert("Load a repo first.");
+  const md = "# Repository Tree\n\n" + treeToMD(globalTree);
+  downloadFile("repo_structure.md", md);
+}
+
+/* ----------------------- BUTTON ----------------------- */
+$("btnLoad").onclick = async ()=>{
+  const o = $("owner").value.trim();
+  const r = $("repo").value.trim();
+  const b = $("branch").value.trim();
+
+  $("status").textContent = "Starting…";
+  try{
+    globalTree = await loadRepoAuto(o, r, b);
+    renderTree(globalTree);
+    $("status").textContent = "Done.";
+  } catch(e){
+    $("status").textContent = "Error: " + e.message;
+    console.error(e);
+  }
+};
+
+$("btnExportJSON").onclick = exportJSON;
+$("btnExportMD").onclick = exportMD;
+
+</script>
+</body>
+</html>
